@@ -88,7 +88,7 @@ class SummaryClient:
         models: str | list[str] | tuple[str, ...] = DEFAULT_GROQ_MODELS,
         prompt_profile: str = "generic",
         prompt_version: str = "v2",
-        max_tokens: int = 700,
+        max_tokens: int = 1200,
     ) -> None:
         self.provider = (provider or "auto").strip().lower()
         self.api_key = (api_key or "").strip() or None
@@ -225,19 +225,62 @@ def build_summary_prompt(*, title: str, text: str, prompt_profile: str = "generi
     )
 
 
+def _strip_code_fences(text: str) -> str:
+    text = re.sub(r"^```(?:json|JSON)?\s*", "", text.strip())
+    text = re.sub(r"\s*```$", "", text).strip()
+    return text
+
+
+def _repair_truncated_json(fragment: str) -> str:
+    """Достраивает обрезанный по max_tokens JSON-объект: закрывает открытую
+    строку, отбрасывает висящую запятую и закрывает незакрытые ``{``/``[``.
+    Спасает headline + успевшие сгенериться bullets вместо полного фейла."""
+    stack: list[str] = []
+    in_str = False
+    escaped = False
+    for ch in fragment:
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    repaired = fragment + ('"' if in_str else "")
+    repaired = re.sub(r",\s*$", "", repaired.rstrip())
+    for opener in reversed(stack):
+        repaired += "}" if opener == "{" else "]"
+    return repaired
+
+
 def parse_json_object(content: str) -> dict | None:
-    text = str(content or "").strip()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            return None
+    """Достаёт JSON-объект из ответа LLM, устойчиво к ``` ```json ```-обёрткам и
+    к обрезке по max_tokens (любая модель из freellmapi-ротации, без пиннинга)."""
+    text = _strip_code_fences(str(content or ""))
+    if not text:
+        return None
+    start = text.find("{")
+    candidates = [text]
+    if start >= 0:
+        candidates.append(text[start:])
+        candidates.append(_repair_truncated_json(text[start:]))
+    for candidate in candidates:
         try:
-            data = json.loads(match.group(0))
+            data = json.loads(candidate)
         except json.JSONDecodeError:
-            return None
-    return data if isinstance(data, dict) else None
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
 
 
 def clean_summary_source_text(text: str) -> str:
